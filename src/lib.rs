@@ -1,3 +1,7 @@
+/// TODO: In future, replace all `Range<u32>` usage to `[u32]`, since every tokens are adjacently
+/// stored in memory, current implementation waste single word for each token to store duplicated
+/// index offset!
+
 macro_rules! impl_seq_view {
     ($Type:ident) => {
         /* ------------------------------------ Display Trait ----------------------------------- */
@@ -25,7 +29,28 @@ macro_rules! impl_seq_view {
         /* ----------------------------------- Iterator Trait ----------------------------------- */
         impl std::hash::Hash for $Type {
             fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                std::hash::Hash::hash(self.text(), state)
+                self.iter().for_each(|x| std::hash::Hash::hash(x, state))
+            }
+        }
+
+        /* -------------------------------------- Comparing ------------------------------------- */
+        impl PartialEq for $Type {
+            fn eq(&self, other: &Self) -> bool {
+                self.iter().eq(other.iter())
+            }
+        }
+
+        impl Eq for $Type {}
+
+        impl PartialOrd for $Type {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                self.iter().partial_cmp(other.iter())
+            }
+        }
+
+        impl Ord for $Type {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.iter().cmp(other.iter())
             }
         }
 
@@ -75,7 +100,7 @@ macro_rules! impl_seq_view {
                 <Self as crate::base_trait::StringSequenceView>::text(self)
             }
 
-            pub fn tokens(&self) -> &[std::ops::Range<u32>] {
+            fn tokens(&self) -> &[std::ops::Range<u32>] {
                 let (_, index) = self.inner();
                 index
             }
@@ -286,7 +311,7 @@ pub mod view {
         sync::Arc,
     };
 
-    use crate::{base_trait::StringSequenceView, mutable::MutableStringSequence};
+    use crate::base_trait::StringSequenceView;
 
     /* ----------------------------------------- Common ----------------------------------------- */
     fn as_inner(slice: &[u8], pivot: usize) -> (&[u8], &[Range<u32>]) {
@@ -301,7 +326,10 @@ pub mod view {
         (buffer, index)
     }
 
-    /* ------------------------------------- String Sequence ------------------------------------ */
+    /* ------------------------------------------------------------------------------------------ */
+    /*                                   COMPACT REPRESENTATION                                   */
+    /* ------------------------------------------------------------------------------------------ */
+
     #[derive(Clone)]
     pub struct StringSequence {
         raw: Box<[u8]>,
@@ -311,7 +339,8 @@ pub mod view {
     impl_seq_view!(StringSequence);
 
     impl StringSequence {
-        fn from_owned_index(index_buf: Vec<Range<u32>>, buffer: &[u8]) -> Self {
+        /// Provides memory reusing constructor.
+        pub(crate) fn from_owned_index(index_buf: Vec<Range<u32>>, buffer: &[u8]) -> Self {
             let mut raw = {
                 let mut raw_vec = ManuallyDrop::new(index_buf);
                 let capacity = raw_vec.capacity() * size_of::<Range<u32>>() + buffer.len();
@@ -329,11 +358,9 @@ pub mod view {
 
             Self { raw: raw.into_boxed_slice(), buffer_offset }
         }
-
-        pub fn create_shared(&self) -> crate::view::SharedStringSequence {
-            crate::view::SharedStringSequence::from(self)
-        }
     }
+
+    /* --------------------------------------- Conversion --------------------------------------- */
 
     impl<'a, T: StringSequenceView> From<&'a T> for StringSequence {
         fn from(value: &'a T) -> Self {
@@ -348,19 +375,9 @@ pub mod view {
         }
     }
 
-    impl From<MutableStringSequence> for StringSequence {
-        fn from(value: MutableStringSequence) -> Self {
-            value.build()
-        }
-    }
-
-    impl MutableStringSequence {
-        pub fn build(self) -> StringSequence {
-            StringSequence::from_owned_index(self.index, &self.text)
-        }
-    }
-
-    /* --------------------------------------- Shared Ref --------------------------------------- */
+    /* ------------------------------------------------------------------------------------------ */
+    /*                                      SHARED REFERENCE                                      */
+    /* ------------------------------------------------------------------------------------------ */
 
     /// Shared compact representation of a sequence of strings.
     #[derive(Clone)]
@@ -389,15 +406,13 @@ pub mod view {
             StringSequence::from_owned_index(index.to_vec(), buffer).into()
         }
     }
-
-    impl From<MutableStringSequence> for SharedStringSequence {
-        fn from(value: MutableStringSequence) -> Self {
-            value.build().into()
-        }
-    }
 }
 pub mod mutable {
-    use crate::base_trait::{up, StringSequenceView};
+    use crate::{
+        base_trait::{up, StringSequenceView, ToRange},
+        view::SharedStringSequence,
+        StringSequence,
+    };
 
     /// A sequence of strings. This is used to represent a path.
     #[derive(Default)]
@@ -420,7 +435,13 @@ pub mod mutable {
     /* ---------------------------------------------------------------------------------------------- */
     /*                                          MANIPULATION                                          */
     /* ---------------------------------------------------------------------------------------------- */
+
     impl MutableStringSequence {
+        /// Create a new empty sequence.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
         /// Reserve space for internal string container.
         ///
         /// NOTE: Consider delimiter length when reserving space.
@@ -452,10 +473,11 @@ pub mod mutable {
         /// Append a string to the internal buffer. As we can't pre-calculate required space for
         /// text buffer, this is inherently inefficient compared to [`Self::extend_from_slice`].
         pub fn extend<T: AsRef<str>>(&mut self, into_iter: impl IntoIterator<Item = T>) {
-            let mut iter = into_iter.into_iter();
+            let iter = into_iter.into_iter();
             let num_elem_hint = iter.size_hint().0;
 
-            // TODO:
+            self.reserve_index(num_elem_hint);
+            iter.for_each(|s| self.push_back(&s));
         }
 
         /// Remove the string at the specified index.
@@ -497,16 +519,148 @@ pub mod mutable {
             self.index.insert(index, offset as _..(offset + value.len()) as _);
             self.text.extend_from_slice(value.as_bytes());
         }
+
+        pub fn clear(&mut self) {
+            self.text.clear();
+            self.index.clear();
+        }
+
+        pub fn drain(&mut self, range: impl ToRange) -> Drain {
+            let self_ptr = self as *mut _;
+
+            let range = range.to_range(self.index.len());
+            let begin = self.index[range.start].start;
+            let end = self.index[range.end - 1].end;
+
+            // Subtract later element's offset before we process draining
+            let removed_text_len = end - begin;
+            self.index[range.end..].iter_mut().for_each(|x| {
+                x.start -= removed_text_len;
+                x.end -= removed_text_len;
+            });
+
+            let drain_iter = self.index.drain(range);
+            Drain { inner: self_ptr, iter: drain_iter, src_text_range: begin..end }
+        }
+
+        pub fn into_string_sequence(self) -> StringSequence {
+            StringSequence::from_owned_index(self.index, &self.text)
+        }
+    }
+
+    /* ------------------------------------- Drain Iterator ------------------------------------- */
+
+    pub struct Drain<'a> {
+        inner: *mut MutableStringSequence,
+        src_text_range: std::ops::Range<u32>,
+        iter: std::vec::Drain<'a, std::ops::Range<u32>>,
+    }
+
+    impl<'a> Drop for Drain<'a> {
+        fn drop(&mut self) {
+            // SAFETY: We won't touch the `self.index` here, which is mutably borrowed for `iter`
+            unsafe { &mut *self.inner }.text.drain(up(self.src_text_range.clone()));
+        }
+    }
+
+    impl<'a> Iterator for Drain<'a> {
+        type Item = std::ops::Range<u32>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.iter.next()
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            self.iter.size_hint()
+        }
     }
 
     /* ------------------------------------------------------------------------------------------ */
-    /*                                            CTOR                                            */
+    /*                                         CONVERSION                                         */
     /* ------------------------------------------------------------------------------------------ */
+
+    impl<'a, T: AsRef<str>> FromIterator<&'a T> for MutableStringSequence {
+        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+            let mut this = Self::default();
+            this.extend(iter);
+            this
+        }
+    }
+
+    impl<'a, T: AsRef<str>> From<&'a [T]> for MutableStringSequence {
+        fn from(value: &'a [T]) -> Self {
+            let mut this = Self::default();
+            this.extend_from_slice(value);
+            this
+        }
+    }
+
+    impl From<String> for MutableStringSequence {
+        fn from(value: String) -> Self {
+            Self { index: vec![0..value.len() as u32], text: value.into_bytes() }
+        }
+    }
+
+    impl From<MutableStringSequence> for String {
+        fn from(value: MutableStringSequence) -> Self {
+            // SAFETY: We know that the buffer is strictly managed to be valid UTF-8 string.
+            unsafe { String::from_utf8_unchecked(value.text) }
+        }
+    }
 
     impl<'a, T: StringSequenceView> From<&'a T> for MutableStringSequence {
         fn from(value: &'a T) -> Self {
             let (buffer, index) = value.inner();
             Self { text: buffer.to_vec(), index: index.to_vec() }
+        }
+    }
+
+    impl From<StringSequence> for MutableStringSequence {
+        fn from(value: StringSequence) -> Self {
+            let (buffer, index) = value.inner();
+            Self { text: buffer.to_vec(), index: index.to_vec() }
+        }
+    }
+
+    impl From<MutableStringSequence> for StringSequence {
+        fn from(value: MutableStringSequence) -> Self {
+            Self::from_owned_index(value.index, &value.text)
+        }
+    }
+
+    impl From<MutableStringSequence> for SharedStringSequence {
+        fn from(value: MutableStringSequence) -> Self {
+            Self::from(StringSequence::from(value))
+        }
+    }
+
+    impl From<SharedStringSequence> for MutableStringSequence {
+        fn from(value: SharedStringSequence) -> Self {
+            Self::from(&value)
+        }
+    }
+
+    impl<'a, T: AsRef<str> + 'a> FromIterator<&'a T> for StringSequence {
+        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+            MutableStringSequence::from_iter(iter).into()
+        }
+    }
+
+    impl<'a, T: AsRef<str>> From<&'a [T]> for StringSequence {
+        fn from(value: &'a [T]) -> Self {
+            MutableStringSequence::from(value).into()
+        }
+    }
+
+    impl<'a, T: AsRef<str> + 'a> FromIterator<&'a T> for SharedStringSequence {
+        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+            MutableStringSequence::from_iter(iter).into()
+        }
+    }
+
+    impl<'a, T: AsRef<str>> From<&'a [T]> for SharedStringSequence {
+        fn from(value: &'a [T]) -> Self {
+            MutableStringSequence::from(value).into()
         }
     }
 }
