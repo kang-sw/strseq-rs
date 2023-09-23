@@ -34,16 +34,16 @@ macro_rules! impl_seq_view {
         }
 
         /* -------------------------------------- Comparing ------------------------------------- */
-        impl PartialEq for $Type {
-            fn eq(&self, other: &Self) -> bool {
+        impl<T: crate::base_trait::StringSequenceView> PartialEq<T> for $Type {
+            fn eq(&self, other: &T) -> bool {
                 self.iter().eq(other.iter())
             }
         }
 
         impl Eq for $Type {}
 
-        impl PartialOrd for $Type {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        impl<T: crate::base_trait::StringSequenceView> PartialOrd<T> for $Type {
+            fn partial_cmp(&self, other: &T) -> Option<std::cmp::Ordering> {
                 self.iter().partial_cmp(other.iter())
             }
         }
@@ -81,6 +81,11 @@ macro_rules! impl_seq_view {
 
         /* -------------------------------------- Type Impl ------------------------------------- */
         impl $Type {
+            fn tokens(&self) -> &[std::ops::Range<u32>] {
+                let (_, index) = self.inner();
+                index
+            }
+
             pub fn iter(&self) -> crate::base_trait::StringSequenceIter {
                 <Self as crate::base_trait::StringSequenceView>::iter(self)
             }
@@ -100,17 +105,12 @@ macro_rules! impl_seq_view {
                 <Self as crate::base_trait::StringSequenceView>::text(self)
             }
 
-            fn tokens(&self) -> &[std::ops::Range<u32>] {
-                let (_, index) = self.inner();
-                index
-            }
-
-            pub fn front(&self) -> Option<&str> {
+            pub fn first(&self) -> Option<&str> {
                 self.get(0)
             }
 
-            pub fn back(&self) -> Option<&str> {
-                self.get(self.tokens().len() - 1)
+            pub fn last(&self) -> Option<&str> {
+                self.get(self.tokens().len().saturating_sub(1))
             }
 
             pub fn len(&self) -> usize {
@@ -229,7 +229,7 @@ mod base_trait {
         x.start as usize..x.end as usize
     }
 
-    fn retr<'a>(buf: &'a [u8], range: Range<u32>) -> &'a str {
+    pub(crate) fn retr<'a>(buf: &'a [u8], range: Range<u32>) -> &'a str {
         // SAFETY: Buffer is strictly managed to be valid UTF-8 string.
         unsafe { std::str::from_utf8_unchecked(&buf[up(range)]) }
     }
@@ -261,11 +261,7 @@ mod base_trait {
         }
 
         fn fmt_debug(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let (buffer, index) = self.inner();
-            f.debug_struct(std::any::type_name::<Self>())
-                .field("buffer", &buffer)
-                .field("index", &index)
-                .finish()
+            f.debug_list().entries(self.iter()).finish()
         }
     }
 
@@ -304,26 +300,20 @@ mod base_trait {
     }
 }
 pub mod view {
-    use std::{
-        mem::{size_of, ManuallyDrop},
-        ops::Range,
-        slice::from_raw_parts,
-        sync::Arc,
-    };
+    use std::{mem::ManuallyDrop, ops::Range, slice::from_raw_parts, sync::Arc};
 
     use crate::base_trait::StringSequenceView;
 
     /* ----------------------------------------- Common ----------------------------------------- */
-    fn as_inner(slice: &[u8], pivot: usize) -> (&[u8], &[Range<u32>]) {
-        let (index, buffer) = slice.split_at(pivot);
+    fn as_inner(slice: &[u64], text_start_index: usize) -> (&[u8], &[Range<u32>]) {
+        let (index, buffer) = slice.split_at(text_start_index);
         // SAFETY: We know that the index is a slice of ranges, which is a slice of usize.
-        let index = unsafe {
-            from_raw_parts(
-                index.as_ptr() as *const Range<u32>,
-                index.len() / size_of::<Range<u32>>(),
-            )
-        };
-        (buffer, index)
+        unsafe {
+            let index = from_raw_parts(index.as_ptr() as *const Range<u32>, index.len());
+            let buffer_len = index.last().map(|x| x.end).unwrap_or(0) as usize;
+
+            (from_raw_parts(buffer.as_ptr() as *const u8, buffer_len), index)
+        }
     }
 
     /* ------------------------------------------------------------------------------------------ */
@@ -332,8 +322,8 @@ pub mod view {
 
     #[derive(Clone)]
     pub struct StringSequence {
-        raw: Box<[u8]>,
-        buffer_offset: usize,
+        raw: Box<[u64]>, // To keep the original alignment of the buffer
+        text_start_index: usize,
     }
 
     impl_seq_view!(StringSequence);
@@ -343,20 +333,30 @@ pub mod view {
         pub(crate) fn from_owned_index(index_buf: Vec<Range<u32>>, buffer: &[u8]) -> Self {
             let mut raw = {
                 let mut raw_vec = ManuallyDrop::new(index_buf);
-                let capacity = raw_vec.capacity() * size_of::<Range<u32>>() + buffer.len();
-                let ptr = raw_vec.as_mut_ptr() as *mut u8;
-                let length_u8 = raw_vec.len() * size_of::<Range<u32>>();
+                let capacity = raw_vec.capacity();
+                let ptr = raw_vec.as_mut_ptr() as *mut u64;
+                let length_u8 = raw_vec.len();
 
                 // SAFETY: We know that the index is a slice of ranges, which is a slice of usize.
                 unsafe { Vec::from_raw_parts(ptr, length_u8, capacity) }
             };
 
-            let buffer_offset = raw.len();
-            raw.reserve_exact(buffer.len());
-            raw.extend_from_slice(buffer);
+            let text_start_index = raw.len();
+            raw.reserve_exact((buffer.len() + 7) / 8);
+
+            // SAFETY: It's just plain old data.
+            let (beg, mid, end) = unsafe { buffer.align_to::<u64>() };
+            debug_assert!(beg.is_empty());
+
+            raw.extend_from_slice(mid);
+
+            let mut last: [u8; 8] = [0; 8];
+            last[..end.len()].copy_from_slice(end);
+            raw.push(u64::from_ne_bytes(last));
+
             raw.shrink_to_fit();
 
-            Self { raw: raw.into_boxed_slice(), buffer_offset }
+            Self { raw: raw.into_boxed_slice(), text_start_index }
         }
     }
 
@@ -371,7 +371,7 @@ pub mod view {
 
     impl StringSequenceView for StringSequence {
         fn inner(&self) -> (&[u8], &[Range<u32>]) {
-            as_inner(&self.raw, self.buffer_offset)
+            as_inner(&self.raw, self.text_start_index)
         }
     }
 
@@ -382,21 +382,21 @@ pub mod view {
     /// Shared compact representation of a sequence of strings.
     #[derive(Clone)]
     pub struct SharedStringSequence {
-        raw: Arc<[u8]>,
-        buffer_offset: usize,
+        raw: Arc<[u64]>,
+        text_start_index: usize,
     }
 
     impl_seq_view!(SharedStringSequence);
 
     impl StringSequenceView for SharedStringSequence {
         fn inner(&self) -> (&[u8], &[Range<u32>]) {
-            as_inner(&self.raw, self.buffer_offset)
+            as_inner(&self.raw, self.text_start_index)
         }
     }
 
     impl From<StringSequence> for SharedStringSequence {
         fn from(value: StringSequence) -> Self {
-            Self { raw: value.raw.into(), buffer_offset: value.buffer_offset }
+            Self { raw: value.raw.into(), text_start_index: value.text_start_index }
         }
     }
 
@@ -409,18 +409,18 @@ pub mod view {
 }
 pub mod mutable {
     use crate::{
-        base_trait::{up, StringSequenceView, ToRange},
+        base_trait::{retr, up, StringSequenceView, ToRange},
         view::SharedStringSequence,
         StringSequence,
     };
 
     /// A sequence of strings. This is used to represent a path.
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     pub struct MutableStringSequence {
         /// Internal buffer, to represent the sequence of strings.
-        pub(crate) text: Vec<u8>,
+        text: Vec<u8>,
         /// Offsets of the strings in the buffer.
-        pub(crate) index: Vec<std::ops::Range<u32>>,
+        index: Vec<std::ops::Range<u32>>,
     }
 
     impl StringSequenceView for MutableStringSequence {
@@ -442,6 +442,21 @@ pub mod mutable {
             Self::default()
         }
 
+        /// Create new instance with capacities
+        pub fn with_capacity(num_tokens: usize, num_chars: usize) -> Self {
+            Self { text: Vec::with_capacity(num_chars), index: Vec::with_capacity(num_tokens) }
+        }
+
+        /// Token array capacity
+        pub fn token_capacity(&self) -> usize {
+            self.index.capacity()
+        }
+
+        /// Text buffer capacity
+        pub fn text_capacity(&self) -> usize {
+            self.text.capacity()
+        }
+
         /// Reserve space for internal string container.
         ///
         /// NOTE: Consider delimiter length when reserving space.
@@ -451,8 +466,8 @@ pub mod mutable {
 
         /// Reserve space for internal index container. Index container indicates the number of
         /// `tokens` that can be appended without reallocation.
-        pub fn reserve_index(&mut self, num_strings: usize) {
-            self.index.reserve(num_strings);
+        pub fn reserve_index(&mut self, num_tokens: usize) {
+            self.index.reserve(num_tokens);
         }
 
         /// Add list of references to the internal buffer.
@@ -501,7 +516,7 @@ pub mod mutable {
         }
 
         /// Append a string to the end of the sequence.
-        pub fn push_back(&mut self, value: &impl AsRef<str>) {
+        pub fn push_back(&mut self, value: impl AsRef<str>) {
             let value = value.as_ref();
             let offset = self.text.len();
             self.index.push(offset as _..(offset + value.len()) as _);
@@ -509,15 +524,19 @@ pub mod mutable {
         }
 
         /// Insert a string at the specified index.
-        pub fn insert(&mut self, value: &impl AsRef<str>, index: usize) {
-            let value = value.as_ref();
-            let offset = self.text.len();
+        pub fn insert(&mut self, index: usize, value: impl AsRef<str>) {
+            let value = value.as_ref().as_bytes();
+            let insert_offset =
+                self.index.get(index).map(|x| x.start).unwrap_or(self.text.len() as _);
+            let offset = insert_offset as usize;
+
             self.index[index..].iter_mut().for_each(|x| {
                 x.start += value.len() as u32;
                 x.end += value.len() as u32;
             });
             self.index.insert(index, offset as _..(offset + value.len()) as _);
-            self.text.extend_from_slice(value.as_bytes());
+
+            self.text.splice(offset..offset, value.iter().copied());
         }
 
         pub fn clear(&mut self) {
@@ -529,6 +548,16 @@ pub mod mutable {
             let self_ptr = self as *mut _;
 
             let range = range.to_range(self.index.len());
+
+            if range.is_empty() {
+                // Early return if the range is empty
+                return Drain {
+                    inner: self_ptr,
+                    iter: self.index.drain(0..0),
+                    text_erase_range: 0..0,
+                };
+            }
+
             let begin = self.index[range.start].start;
             let end = self.index[range.end - 1].end;
 
@@ -540,7 +569,7 @@ pub mod mutable {
             });
 
             let drain_iter = self.index.drain(range);
-            Drain { inner: self_ptr, iter: drain_iter, src_text_range: begin..end }
+            Drain { inner: self_ptr, iter: drain_iter, text_erase_range: begin..end }
         }
 
         pub fn into_string_sequence(self) -> StringSequence {
@@ -552,22 +581,23 @@ pub mod mutable {
 
     pub struct Drain<'a> {
         inner: *mut MutableStringSequence,
-        src_text_range: std::ops::Range<u32>,
+        text_erase_range: std::ops::Range<u32>,
         iter: std::vec::Drain<'a, std::ops::Range<u32>>,
     }
 
     impl<'a> Drop for Drain<'a> {
         fn drop(&mut self) {
             // SAFETY: We won't touch the `self.index` here, which is mutably borrowed for `iter`
-            unsafe { &mut *self.inner }.text.drain(up(self.src_text_range.clone()));
+            unsafe { &mut *self.inner }.text.drain(up(self.text_erase_range.clone()));
         }
     }
 
     impl<'a> Iterator for Drain<'a> {
-        type Item = std::ops::Range<u32>;
+        type Item = &'a str;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.iter.next()
+            // SAFETY: We won't touch the `self.index` here, which is mutably borrowed for `iter`
+            self.iter.next().map(|range| unsafe { retr(&(*self.inner).text, range) })
         }
 
         fn size_hint(&self) -> (usize, Option<usize>) {
@@ -579,18 +609,18 @@ pub mod mutable {
     /*                                         CONVERSION                                         */
     /* ------------------------------------------------------------------------------------------ */
 
-    impl<'a, T: AsRef<str>> FromIterator<&'a T> for MutableStringSequence {
-        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+    impl<'a, T: AsRef<str>> FromIterator<T> for MutableStringSequence {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
             let mut this = Self::default();
             this.extend(iter);
             this
         }
     }
 
-    impl<'a, T: AsRef<str>> From<&'a [T]> for MutableStringSequence {
-        fn from(value: &'a [T]) -> Self {
+    impl MutableStringSequence {
+        pub fn from_slice(slice: &[impl AsRef<str>]) -> Self {
             let mut this = Self::default();
-            this.extend_from_slice(value);
+            this.extend_from_slice(slice);
             this
         }
     }
@@ -640,27 +670,27 @@ pub mod mutable {
         }
     }
 
-    impl<'a, T: AsRef<str> + 'a> FromIterator<&'a T> for StringSequence {
-        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+    impl<'a, T: AsRef<str> + 'a> FromIterator<T> for StringSequence {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
             MutableStringSequence::from_iter(iter).into()
         }
     }
 
-    impl<'a, T: AsRef<str>> From<&'a [T]> for StringSequence {
-        fn from(value: &'a [T]) -> Self {
-            MutableStringSequence::from(value).into()
+    impl StringSequence {
+        pub fn from_slice(slice: &[impl AsRef<str>]) -> Self {
+            MutableStringSequence::from_slice(slice).into()
         }
     }
 
-    impl<'a, T: AsRef<str> + 'a> FromIterator<&'a T> for SharedStringSequence {
-        fn from_iter<I: IntoIterator<Item = &'a T>>(iter: I) -> Self {
+    impl<'a, T: AsRef<str> + 'a> FromIterator<T> for SharedStringSequence {
+        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
             MutableStringSequence::from_iter(iter).into()
         }
     }
 
-    impl<'a, T: AsRef<str>> From<&'a [T]> for SharedStringSequence {
-        fn from(value: &'a [T]) -> Self {
-            MutableStringSequence::from(value).into()
+    impl SharedStringSequence {
+        pub fn from_slice(slice: &[impl AsRef<str>]) -> Self {
+            MutableStringSequence::from_slice(slice).into()
         }
     }
 }
@@ -672,3 +702,135 @@ mod serde_impl {
 
 pub use mutable::MutableStringSequence;
 pub use view::{SharedStringSequence, StringSequence};
+
+#[cfg(test)]
+mod tests {
+    use std::ops::RangeBounds;
+
+    use crate::{base_trait::ToRange, MutableStringSequence, SharedStringSequence, StringSequence};
+
+    #[test]
+    fn basics() {
+        let hello_world = ["Hello,", " World!", "asd", " ahgteaw", "adsgads", "dsagkd"];
+
+        assert_eq!(
+            dbg!(MutableStringSequence::from_iter(hello_world)),
+            StringSequence::from_iter(hello_world)
+        );
+
+        assert_eq!(
+            MutableStringSequence::from_iter(hello_world),
+            SharedStringSequence::from_iter(hello_world)
+        );
+    }
+
+    #[test]
+    fn mutation() {
+        let mut seq = MutableStringSequence::new();
+
+        seq.push_back("hello");
+        assert!(seq.iter().eq(["hello"]));
+        assert!(seq.clone().into_string_sequence().iter().eq(["hello"]));
+        assert_eq!(seq.text(), "hello");
+
+        seq.push_back("world");
+        assert!(seq.iter().eq(["hello", "world"]));
+        assert!(seq.clone().into_string_sequence().iter().eq(["hello", "world"]));
+        assert_eq!(seq.text(), "helloworld");
+
+        seq.insert(0, "!");
+        assert!(dbg!(&seq).iter().eq(["!", "hello", "world"]));
+        assert!(dbg!(&seq.clone().into_string_sequence()).iter().eq(["!", "hello", "world"]));
+        assert_eq!(seq.text(), "!helloworld");
+
+        seq.insert(0, "howdy");
+        assert!(seq.iter().eq(["howdy", "!", "hello", "world"]));
+        assert!(seq.clone().into_string_sequence().iter().eq(["howdy", "!", "hello", "world"]));
+        assert_eq!(seq.text(), "howdy!helloworld");
+
+        assert!(seq.drain(1..3).eq(["!", "hello"]));
+        assert!(seq.iter().eq(["howdy", "world"]));
+        assert!(seq.clone().into_string_sequence().iter().eq(["howdy", "world"]));
+        assert_eq!(seq.text(), "howdyworld");
+
+        assert_eq!(seq.drain(0..0).count(), 0);
+        assert!(seq.iter().eq(["howdy", "world"]));
+
+        seq.extend(seq.clone().drain(..).chain(seq.clone().drain(..)));
+        assert!(seq.iter().eq(["howdy", "world", "howdy", "world", "howdy", "world"]));
+    }
+
+    macro_rules! generate_view_test {
+        ($func_name:ident, $type_name:ty) => {
+            fn $func_name(view: $type_name, expected: &[&str]) {
+                assert!(view.iter().eq(expected.iter().copied()));
+                assert_eq!(view.len(), expected.len());
+                assert_eq!(view.text(), expected.join(""));
+                assert_eq!(view.first(), expected.first().copied());
+                assert_eq!(view.last(), expected.last().copied());
+
+                let array_len = expected.len();
+                let ranges = [
+                    ToRange::to_range(.., array_len),
+                    ToRange::to_range(..0, array_len),
+                    ToRange::to_range(0.., array_len),
+                    ToRange::to_range(..array_len, array_len),
+                    ToRange::to_range(0..array_len, array_len),
+                    ToRange::to_range(0..array_len / 2, array_len),
+                    ToRange::to_range(array_len / 2..array_len, array_len),
+                ];
+
+                assert!(view.starts_with(&expected[..]));
+                assert!(view.starts_with(&expected[..array_len / 2]));
+                assert!(view.ends_with(&expected[array_len / 2..array_len]));
+
+                for range in ranges.iter() {
+                    assert!(view.slice(range.clone()).eq(expected[range.clone()].iter().copied()));
+                    assert!(view.contains(&expected[range.clone()]));
+                }
+            }
+        };
+    }
+
+    generate_view_test!(test_view_seq, StringSequence);
+    generate_view_test!(test_view_mut, MutableStringSequence);
+    generate_view_test!(test_view_share, SharedStringSequence);
+
+    #[test]
+    fn view() {
+        let vars: &[&[&str]] = &[
+            &["dsagdsaf", "ewarsdag", "adsgsdag", "dfd0k99", "llas0px;;;"], // only ascii
+            &["dsagdsaf", "ewarsdag", "adsgsdag", "ㅇㄴ미ㅠ채ㅑㅁㄷ", "ㅇㄴ미ㅏㅊ"], // with unicode
+            &["dsagdsaf", "ashg", "asdglkjic090a", "ㅇㄴ미ㅠ채ㅑㅁㄷ", "ㅇㄴ미ㅏㅊ"],
+            &["ㅐㄴㅇ0", "ㄹㅇㄴ02.,", " ㅇㄴ마🤣🤣🤣", "ㅇㄴㅁ000"], // with emoji (4B)
+            &["asdlk0f99"],
+            &[],
+            &["--9dsc0", "0as-=-ㄴㅁ0", "ㅊ,ㅍ0009", "ㄴ00ㅏㅏ0-ㅔ;"],
+        ];
+
+        for var in vars {
+            let view = MutableStringSequence::from_slice(var);
+            test_view_seq(view.clone().into(), var);
+            test_view_share(view.clone().into(), var);
+            test_view_mut(view, var);
+        }
+    }
+
+    #[test]
+    fn stability() {
+        for _ in 0..5 {
+            let var: Vec<_> = (0..5000)
+                .map(|_| {
+                    String::from_iter((0..rand::random::<u8>()).map(|_| rand::random::<char>()))
+                })
+                .collect();
+
+            let var = Vec::from_iter(var.iter().map(|x| x.as_str()));
+            let var = &var[..];
+            let view = MutableStringSequence::from_slice(&var);
+            test_view_seq(view.clone().into(), var);
+            test_view_share(view.clone().into(), var);
+            test_view_mut(view, var);
+        }
+    }
+}

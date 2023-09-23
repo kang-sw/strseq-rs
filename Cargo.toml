@@ -14,3 +14,6 @@ serde = { version = "1.0.188", optional = true }
 
 [features]
 serde = ["dep:serde"]
+
+[dev-dependencies]
+rand = "0.8.5"
