@@ -705,8 +705,6 @@ pub use view::{SharedStringSequence, StringSequence};
 
 #[cfg(test)]
 mod tests {
-    use std::ops::RangeBounds;
-
     use crate::{base_trait::ToRange, MutableStringSequence, SharedStringSequence, StringSequence};
 
     #[test]
