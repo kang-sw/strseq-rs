@@ -229,7 +229,7 @@ mod base_trait {
         x.start as usize..x.end as usize
     }
 
-    pub(crate) fn retr<'a>(buf: &'a [u8], range: Range<u32>) -> &'a str {
+    pub(crate) fn retr(buf: &[u8], range: Range<u32>) -> &str {
         // SAFETY: Buffer is strictly managed to be valid UTF-8 string.
         unsafe { std::str::from_utf8_unchecked(&buf[up(range)]) }
     }
@@ -242,12 +242,12 @@ mod base_trait {
 
         fn iter(&self) -> StringSequenceIter {
             let (buffer, index) = self.inner();
-            StringSequenceIter { buffer: buffer, index: index.iter() }
+            StringSequenceIter { buffer, index: index.iter() }
         }
 
         fn slice(&self, range: impl ToRange) -> StringSequenceIter {
             let (buffer, index) = self.inner();
-            StringSequenceIter { buffer: buffer, index: index[range.to_range(index.len())].iter() }
+            StringSequenceIter { buffer, index: index[range.to_range(index.len())].iter() }
         }
 
         fn text(&self) -> &str {
@@ -609,7 +609,7 @@ pub mod mutable {
     /*                                         CONVERSION                                         */
     /* ------------------------------------------------------------------------------------------ */
 
-    impl<'a, T: AsRef<str>> FromIterator<T> for MutableStringSequence {
+    impl<T: AsRef<str>> FromIterator<T> for MutableStringSequence {
         fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
             let mut this = Self::default();
             this.extend(iter);
@@ -627,7 +627,8 @@ pub mod mutable {
 
     impl From<String> for MutableStringSequence {
         fn from(value: String) -> Self {
-            Self { index: vec![0..value.len() as u32], text: value.into_bytes() }
+            let unique_index = 0..value.len() as u32;
+            Self { index: [unique_index].into(), text: value.into_bytes() }
         }
     }
 
