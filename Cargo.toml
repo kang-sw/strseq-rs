@@ -1,0 +1,16 @@
+[package]
+name = "strseq"
+version = "0.1.0"
+edition = "2021"
+authors = ["kang-sw <ki6080@gmail.com>"]
+description = "A string sequence library for Rust"
+license = "MIT"
+repository = "https://github.com/kang-sw/strseq-rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "1.0.188", optional = true }
+
+[features]
+serde = ["dep:serde"]
