@@ -84,6 +84,8 @@ impl StringSequenceView for StringSequence {
 /* ------------------------------------------------------------------------------------------ */
 
 /// Shared compact representation of a sequence of strings.
+///
+/// It can represent only a subsequence of the original sequence.
 #[derive(Clone)]
 pub struct SharedStringSequence {
     raw: Arc<[[u32; 2]]>,
