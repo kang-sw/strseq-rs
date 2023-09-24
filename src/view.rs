@@ -1,11 +1,13 @@
-use std::{mem::ManuallyDrop, ops::Range, slice::from_raw_parts, sync::Arc};
+use std::{ops::Range, slice::from_raw_parts, sync::Arc};
 
-use crate::base_trait::StringSequenceView;
+use crate::base_trait::{up, StringSequenceView, ToRange};
 
 /* ----------------------------------------- Common ----------------------------------------- */
-fn as_inner(slice: &[u64], text_start_index: usize) -> (&[u8], &[Range<u32>]) {
+#[inline]
+fn as_inner(slice: &[[u32; 2]], text_start_index: usize) -> (&[u8], &[Range<u32>]) {
     let (index, buffer) = slice.split_at(text_start_index);
-    // SAFETY: We know that the index is a slice of ranges, which is a slice of usize.
+
+    // SAFETY: Plain POD conversion
     unsafe {
         let index = from_raw_parts(index.as_ptr() as *const Range<u32>, index.len());
         let buffer_len = index.last().map(|x| x.end).unwrap_or(0) as usize;
@@ -20,8 +22,8 @@ fn as_inner(slice: &[u64], text_start_index: usize) -> (&[u8], &[Range<u32>]) {
 
 #[derive(Clone)]
 pub struct StringSequence {
-    raw: Box<[u64]>, // To keep the original alignment of the buffer
-    text_start_index: usize,
+    raw: Box<[[u32; 2]]>, // To keep the original alignment of the buffer
+    index_count: usize,
 }
 
 impl_seq_view!(StringSequence);
@@ -36,24 +38,29 @@ impl StringSequence {
         //      because it has non-trivial logic for cloning.
         //  - Element size is the same
         //  - Destination type's memory alignment is more permissive
-        let mut raw: Vec<u64> = unsafe { std::mem::transmute(index_buf) };
+        let mut raw: Vec<[u32; 2]> = unsafe { std::mem::transmute(index_buf) };
 
         let text_start_index = raw.len();
         raw.reserve_exact((text.len() + 7) / 8);
 
         // SAFETY: It's just plain old data.
-        let (beg, mid, end) = unsafe { text.align_to::<u64>() };
+        let (beg, mid, end) = unsafe { text.align_to::<[u32; 2]>() };
         debug_assert!(beg.is_empty());
 
         raw.extend_from_slice(mid);
 
-        let mut last: [u8; 8] = [0; 8];
-        last[..end.len()].copy_from_slice(end);
-        raw.push(u64::from_ne_bytes(last));
+        let from_slice = |slice: &[u8]| {
+            u32::from_ne_bytes(std::array::from_fn(|index| {
+                slice.get(index).copied().unwrap_or_default()
+            }))
+        };
+
+        // Push remaining bytes
+        raw.push([from_slice(end), from_slice(&end[4.min(end.len())..])]);
 
         raw.shrink_to_fit();
 
-        Self { raw: raw.into_boxed_slice(), text_start_index }
+        Self { raw: raw.into_boxed_slice(), index_count: text_start_index }
     }
 }
 
@@ -68,7 +75,7 @@ impl<'a, T: StringSequenceView> From<&'a T> for StringSequence {
 
 impl StringSequenceView for StringSequence {
     fn inner(&self) -> (&[u8], &[Range<u32>]) {
-        as_inner(&self.raw, self.text_start_index)
+        as_inner(&self.raw, self.index_count)
     }
 }
 
@@ -79,16 +86,36 @@ impl StringSequenceView for StringSequence {
 /// Shared compact representation of a sequence of strings.
 #[derive(Clone)]
 pub struct SharedStringSequence {
-    raw: Arc<[u64]>,
-    text_start_index: usize,
+    raw: Arc<[[u32; 2]]>,
+    index_count: usize,
     token_range: Range<u32>, // Naively expect we won't store more than 2^32 tokens.
 }
 
 impl_seq_view!(SharedStringSequence);
 
+impl SharedStringSequence {
+    pub fn subsequence(&self, range: impl ToRange) -> Self {
+        let range = range.to_range(self.index_count);
+        Self { token_range: range.start as _..range.end as _, ..self.clone() }
+    }
+
+    pub fn into_full_sequence(self) -> Self {
+        Self { token_range: 0..self.index_count as _, ..self }
+    }
+}
+
 impl StringSequenceView for SharedStringSequence {
     fn inner(&self) -> (&[u8], &[Range<u32>]) {
-        as_inner(&self.raw, self.text_start_index)
+        let (text, index) = as_inner(&self.raw, self.index_count);
+        (text, &index[up(self.token_range.clone())])
+    }
+
+    fn text(&self) -> &str {
+        let (text, buffer) = self.inner();
+        let start = buffer.first().map(|x| x.start).unwrap_or(0) as usize;
+        let end = buffer.last().map(|x| x.end).unwrap_or(0) as usize;
+
+        unsafe { std::str::from_utf8_unchecked(&text[start..end]) }
     }
 }
 
@@ -96,8 +123,8 @@ impl From<StringSequence> for SharedStringSequence {
     fn from(value: StringSequence) -> Self {
         Self {
             raw: value.raw.into(),
-            text_start_index: value.text_start_index,
-            token_range: 0..value.text_start_index as _,
+            index_count: value.index_count,
+            token_range: 0..value.index_count as _,
         }
     }
 }

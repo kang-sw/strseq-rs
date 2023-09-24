@@ -65,7 +65,7 @@ macro_rules! generate_view_test {
                 ToRange::to_range(.., array_len),
                 ToRange::to_range(..0, array_len),
                 ToRange::to_range(0.., array_len),
-                ToRange::to_range(..array_len, array_len),
+                ToRange::to_range(..array_len / 2, array_len),
                 ToRange::to_range(0..array_len, array_len),
                 ToRange::to_range(0..array_len / 2, array_len),
                 ToRange::to_range(array_len / 2..array_len, array_len),
@@ -100,10 +100,20 @@ fn view() {
         &["--9dsc0", "0as-=-ㄴㅁ0", "ㅊ,ㅍ0009", "ㄴ00ㅏㅏ0-ㅔ;"],
     ];
 
-    for var in vars {
+    for var in vars.iter().copied() {
         let view = MutableStringSequence::from_slice(var);
         test_view_seq(view.clone().into(), var);
-        test_view_share(view.clone().into(), var);
+
+        let shared = SharedStringSequence::from(&view);
+        test_view_share(shared.clone(), var);
+
+        let range_begin = rand::random::<u8>() % 8;
+        let range_size = rand::random::<u8>() % 8;
+        let begin = (range_begin as usize).min(var.len());
+        let end = (begin + range_size as usize).min(var.len());
+
+        test_view_share(shared.subsequence(begin..end), &var[begin..end]);
+
         test_view_mut(view, var);
     }
 
